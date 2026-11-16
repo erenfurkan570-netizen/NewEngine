@@ -1,0 +1,130 @@
+name: Engine CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  CMAKE_GENERATOR: Ninja
+  NDK_VERSION: "r27c"
+
+jobs:
+  # ─── Linux Native Build (test + hata yakalama) ───
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+          # Vulkan header'ları (CI'da sadece compile, runtime değil)
+          sudo apt-get install -y libvulkan-dev vulkan-validationlayers
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-linux-${{ matrix.build_type }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: >
+          cmake -S . -B build/linux-${{ matrix.build_type }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -G Ninja
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DENABLE_VULKAN=ON
+
+      - name: Build
+        run: cmake --build build/linux-${{ matrix.build_type }} --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build/linux-${{ matrix.build_type }} --output-on-failure
+
+  # ─── Android arm64 Cross-Compile (Termux'tan kullanacağın binary) ───
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NDK
+        uses: nuxwd/android-build@v2.6
+        with:
+          ndk: ${{ env.NDK_VERSION }}
+          api-level: 28
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-android-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure (arm64-v8a)
+        run: |
+          cmake -S . -B build/android-arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            -DANDROID_CPP_FEATURES="rtti exceptions" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DENABLE_VULKAN=ON \
+            -DVK_USE_PLATFORM_ANDROID_KHR=ON \
+            -DENABLE_GAME_ACTIVITY=ON
+
+      - name: Build
+        run: cmake --build build/android-arm64 --parallel
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist/android
+          cp build/android-arm64/engine/libengine.so dist/android/
+          cp build/android-arm64/runtime/engine dist/android/ 2>/dev/null || true
+          # Shader'lar / asset'ler varsa
+          cp -r assets/ dist/android/ 2>/dev/null || true
+          tar -czf android-engine-arm64.tar.gz -C dist android/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-android-arm64
+          path: android-engine-arm64.tar.gz
+          retention-days: 14
+
+  # ─── Shader Compilation (GLSL → SPIR-V) ───
+  compile-shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install glslang
+        run: sudo apt-get install -y glslang-tools
+
+      - name: Compile shaders
+        run: |
+          mkdir -p build/shaders
+          for shader in $(find shaders/ -name "*.vert" -o -name "*.frag" -o -name "*.comp"); do
+            glslangValidator --target-env vulkan1.2 \
+              -o "build/shaders/$(basename ${shader%.*}).spv" \
+              "$shader"
+            echo "✓ $shader → .spv"
+          done
+
+      - name: Upload shaders
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-shaders
+          path: build/shaders/
+          retention-days: 14   
